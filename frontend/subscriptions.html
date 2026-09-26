@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>告警通知订阅 · 风控引擎</title>
+<link rel="stylesheet" href="assets/css/style.css">
+<script src="assets/js/api.js"></script>
+<style>
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip { font-size: 11px; padding: 1px 8px; border-radius: 10px; background: #f1f5f9; color: #475569; }
+  .check-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 12px; max-height: 150px; overflow-y: auto;
+    border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: #fbfcfe; }
+  .check-grid label { display: flex; align-items: center; gap: 6px; font-weight: 400; color: var(--text); margin: 0; font-size: 12.5px; }
+  .check-grid input { width: auto; }
+  .rate-bar { width: 90px; height: 6px; border-radius: 4px; background: #e5e7eb; overflow: hidden; display: inline-block; vertical-align: middle; }
+  .rate-bar > i { display: block; height: 100%; background: var(--success); }
+  .rate-bar.low > i { background: var(--danger); }
+  .rate-bar.mid > i { background: var(--warning); }
+  .dlv-attempts td { font-size: 12px; }
+  .switch { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12.5px; }
+  .switch input { width: auto; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const LEVELS = ["低", "中", "高", "严重"];
+let RULES = [];        // [{id, name, description, enabled}]
+let EVENT_TYPES = [];  // [{key, value}]
+let subsCache = [];
+
+// ---------------------------------------------------------------------------
+// 列表
+// ---------------------------------------------------------------------------
+async function loadMeta() {
+  const [rr, dr] = await Promise.all([
+    API.get("/api/rules", { silent: true }).catch(() => ({ rules: [] })),
+    API.get("/api/dict", { silent: true }).catch(() => ({ dict: { entries: [] } })),
+  ]);
+  RULES = (rr.rules || []).slice().sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh"));
+  EVENT_TYPES = (dr.dict.entries || []).filter(e => e.category === "事件类型");
+}
+
+function ruleName(id) {
+  const r = RULES.find(x => x.id === id);
+  return r ? (r.name || r.id) : id;
+}
+function eventLabel(key) {
+  const e = EVENT_TYPES.find(x => x.key === key);
+  return e ? e.value : key;
+}
+
+function rateCell(stats) {
+  const rate = stats.success_rate;
+  if (rate == null) return '<span class="muted">暂无</span>';
+  const pct = Math.round(rate * 100);
+  const cls = rate >= 0.9 ? "" : rate >= 0.6 ? "mid" : "low";
+  return `<span class="rate-bar ${cls}"><i style="width:${pct}%"></i></span>
+          <b style="margin-left:6px">${pct}%</b>`;
+}
+
+function filterChips(s) {
+  const parts = [];
+  (s.levels || []).forEach(lv => parts.push(`<span class="chip">等级:${UI.esc(lv)}</span>`));
+  (s.rule_ids || []).forEach(id => parts.push(`<span class="chip" title="${UI.esc(id)}">规则:${UI.esc(ruleName(id))}</span>`));
+  (s.event_types || []).forEach(t => parts.push(`<span class="chip">事件:${UI.esc(eventLabel(t))}</span>`));
+  if (!parts.length) parts.push('<span class="chip">全部告警</span>');
+  return `<div class="chips">${parts.join("")}</div>`;
+}
+
+async function load() {
+  const r = await API.get("/api/subscriptions");
+  subsCache = r.subscriptions;
+  const tbody = document.getElementById("sub-list");
+  if (!subsCache.length) {
+    tbody.innerHTML = `<tr><td colspan="9"><div class="empty">还没有订阅，点击右上角「＋ 新建订阅」开始接收告警通知</div></td></tr>`;
+  } else {
+    tbody.innerHTML = subsCache.map(s => `
+      <tr>
+        <td>${UI.esc(s.name)}${s.remark ? `<div class="muted" style="font-size:11px">${UI.esc(s.remark)}</div>` : ""}</td>
+        <td><span class="badge ${s.channel === "webhook" ? "info" : "primary"}">${s.channel === "webhook" ? "🔗 Webhook" : "✉️ 邮件"}</span>
+            <div class="mono muted" style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${UI.esc(s.target)}">${UI.esc(s.target)}</div></td>
+        <td>${filterChips(s)}</td>
+        <td>${s.enabled ? '<span class="badge success">启用</span>' : '<span class="badge muted">停用</span>'}</td>
+        <td class="num">${(s.stats && s.stats.total) || 0}</td>
+        <td class="num"><span class="badge success">${(s.stats && s.stats.success) || 0}</span>
+            ${(s.stats && s.stats.failed) ? ` <span class="badge danger">${s.stats.failed}</span>` : ""}
+            ${(s.stats && s.stats.pending) ? ` <span class="badge warning">${s.stats.pending}</span>` : ""}</td>
+        <td>${rateCell(s.stats || {})}</td>
+        <td class="mono">${s.stats && s.stats.last_push ? UI.fmtTime(s.stats.last_push) : "-"}</td>
+        <td class="text-right" style="white-space:nowrap">
+          <button class="btn sm" onclick="toggleEnabled('${s.id}', ${!s.enabled})">${s.enabled ? "停用" : "启用"}</button>
+          <button class="btn sm" onclick="editSub('${s.id}')">编辑</button>
+          <button class="btn sm" onclick="testSub('${s.id}')">测试</button>
+          <button class="btn sm" onclick="showHistory('${s.id}')">历史</button>
+          <button class="btn sm danger" onclick="delSub('${s.id}')">删除</button>
+        </td>
+      </tr>`).join("");
+  }
+}
+
+async function toggleEnabled(id, enabled) {
+  await API.post(`/api/subscriptions/${id}/enable`, { enabled });
+  UI.toast(enabled ? "已启用" : "已停用", "ok");
+  load();
+}
+
+async function testSub(id) {
+  UI.toast("正在发送测试通知…");
+  try {
+    const r = await API.post(`/api/subscriptions/${id}/test`);
+    if (r.success) UI.toast("测试通知发送成功 ✅", "ok");
+    else UI.toast("发送失败：" + (r.error || "未知错误"), "err");
+  } catch (e) { UI.toast(e.message, "err"); }
+}
+
+async function delSub(id) {
+  if (!confirm("确认删除该订阅？删除后其推送历史仍会保留。")) return;
+  await API.del(`/api/subscriptions/${id}`);
+  UI.toast("已删除", "ok");
+  load();
+}
+
+// ---------------------------------------------------------------------------
+// 新建 / 编辑
+// ---------------------------------------------------------------------------
+function checkboxPanel(items, selected, idPrefix, render) {
+  return `<div class="check-grid">${items.map(it => {
+    const key = render(it).key;
+    const label = render(it).label;
+    return `<label><input type="checkbox" id="${idPrefix}-${UI.esc(String(key)).replace(/[^a-zA-Z0-9_-]/g, "_")}"
+                    data-key="${UI.esc(key)}" ${selected.includes(String(key)) ? "checked" : ""}>${UI.esc(label)}</label>`;
+  }).join("")}</div>`;
+}
+
+function checkedKeys(containerId) {
+  return [...document.querySelectorAll(`#${containerId} input[type=checkbox]:checked`)].map(cb => cb.dataset.key);
+}
+
+function openEditor(sub) {
+  const isEdit = !!sub;
+  const s = sub || { levels: [], rule_ids: [], event_types: [], channel: "webhook", enabled: true };
+  const body = `
+    <div class="field"><label>订阅名称 *</label><input id="f-name" value="${UI.esc(s.name || "")}" placeholder="如：高危告警-值班群"></div>
+    <div class="row">
+      <div class="field" style="max-width:160px"><label>推送渠道 *</label>
+        <select id="f-channel">
+          <option value="webhook" ${s.channel === "webhook" ? "selected" : ""}>🔗 Webhook</option>
+          <option value="email" ${s.channel === "email" ? "selected" : ""}>✉️ 邮件</option>
+        </select></div>
+      <div class="field"><label id="f-target-label">Webhook 地址 *</label>
+        <input id="f-target" value="${UI.esc(s.target || "")}" placeholder="https://example.com/hook 或 ops@example.com"></div>
+    </div>
+    <div class="field" id="f-secret-wrap"><label>签名密钥（可选）</label>
+      <input id="f-secret" type="password" placeholder="${isEdit ? "留空表示不修改；将以 X-Signature-SHA256 头发送 HMAC 签名" : "将以 X-Signature-SHA256 头发送 HMAC-SHA256 签名"}"></div>
+    <div class="field"><label>订阅条件：告警等级（不勾=全部等级）</label>
+      <div id="f-levels">${checkboxPanel(LEVELS, s.levels || [], "lv", x => ({ key: x, label: x }))}</div></div>
+    <div class="field"><label>订阅条件：规则（不勾=全部规则）</label>
+      <div id="f-rules">${checkboxPanel(RULES, s.rule_ids || [], "rl", r => ({ key: r.id, label: `${r.name}（${r.id}）` }))}</div></div>
+    <div class="field"><label>订阅条件：事件类型（不勾=全部类型）</label>
+      <div id="f-etypes">${checkboxPanel(EVENT_TYPES, s.event_types || [], "et", e => ({ key: e.key, label: `${e.value}（${e.key}）` }))}</div></div>
+    <div class="field"><label>备注</label><input id="f-remark" value="${UI.esc(s.remark || "")}"></div>
+    <label class="switch"><input type="checkbox" id="f-enabled" ${s.enabled !== false ? "checked" : ""}> 立即启用</label>`;
+
+  UI.modal(isEdit ? "编辑订阅" : "新建订阅", body,
+    `<button class="btn" onclick="document.querySelector('#modal-mask').classList.remove('show')">取消</button>
+     <button class="btn primary" onclick="saveSub('${isEdit ? s.id : ""}')">保存</button>`);
+
+  const channelEl = document.getElementById("f-channel");
+  const syncChannel = () => {
+    const isMail = channelEl.value === "email";
+    document.getElementById("f-target-label").textContent = isMail ? "收件邮箱 *（多个用逗号分隔）" : "Webhook 地址 *";
+    document.getElementById("f-secret-wrap").style.display = isMail ? "none" : "";
+  };
+  channelEl.onchange = syncChannel;
+  syncChannel();
+}
+
+async function saveSub(id) {
+  const body = {
+    name: document.getElementById("f-name").value.trim(),
+    channel: document.getElementById("f-channel").value,
+    target: document.getElementById("f-target").value.trim(),
+    levels: checkedKeys("f-levels"),
+    rule_ids: checkedKeys("f-rules"),
+    event_types: checkedKeys("f-etypes"),
+    remark: document.getElementById("f-remark").value.trim(),
+    enabled: document.getElementById("f-enabled").checked,
+  };
+  const secret = document.getElementById("f-secret").value;
+  if (secret) body.secret = secret;
+  try {
+    if (id) await API.put(`/api/subscriptions/${id}`, body);
+    else await API.post("/api/subscriptions", body);
+    UI.toast("已保存", "ok");
+    document.querySelector("#modal-mask").classList.remove("show");
+    load();
+  } catch (e) { UI.toast(e.message, "err"); }
+}
+
+function editSub(id) {
+  const s = subsCache.find(x => x.id === id);
+  if (s) openEditor(s);
+}
+
+// ---------------------------------------------------------------------------
+// 推送历史
+// ---------------------------------------------------------------------------
+function statusBadge(st) {
+  const map = { pending: ["推送中", "warning"], success: ["成功", "success"], failed: ["失败", "danger"] };
+  const [label, cls] = map[st] || [st, "muted"];
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
+function attemptsHtml(d) {
+  const rows = (d.attempts || []).map((a, i) => `
+    <tr>
+      <td>第 ${i + 1} 次</td>
+      <td class="mono">${UI.fmtTime(a.ts)}</td>
+      <td class="num">${a.elapsed_ms} ms</td>
+      <td>${a.http_status ? UI.esc(a.http_status) : "-"}</td>
+      <td>${a.status === "ok" ? '<span class="badge success">成功</span>' : `<span class="badge danger">失败</span> <span class="muted">${UI.esc(a.error || "")}</span>`}</td>
+    </tr>`).join("");
+  return `<table class="dlv-attempts" style="margin-top:6px">
+    <thead><tr><th>尝试</th><th>时间</th><th>耗时</th><th>HTTP</th><th>结果</th></tr></thead>
+    <tbody>${rows || `<tr><td colspan="5" class="muted">暂无尝试记录</td></tr>`}</tbody></table>`;
+}
+
+async function showHistory(subId) {
+  const sub = subsCache.find(x => x.id === subId);
+  UI.modal(`推送历史 · ${sub ? sub.name : subId}`, '<div class="muted">加载中…</div>');
+  const r = await API.get(`/api/subscriptions/${subId}/deliveries?limit=100`);
+  const items = r.deliveries || [];
+  const rate = r.success_rate == null ? "暂无" : Math.round(r.success_rate * 100) + "%";
+  const body = `
+    <div class="flex mb" style="justify-content:space-between">
+      <span>共 <b>${r.total}</b> 条记录，成功率 <b>${rate}</b></span>
+      <span class="muted" style="font-size:12px">点击行展开每次尝试详情（含失败原因与重试）</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>告警</th><th>等级</th><th>渠道/目标</th><th>状态</th><th>尝试</th><th>错误</th></tr></thead>
+        <tbody>
+          ${items.length ? items.map((d, i) => `
+            <tr class="clickable" onclick="var r=document.getElementById('att-${i}');r.style.display=r.style.display==='none'?'':'none';var r2=document.getElementById('att-${i}');r2.style.display=r2.style.display==='none'?'table-row':'none';">
+              <td class="mono">${UI.fmtTime(d.created_at)}</td>
+              <td>${UI.esc(d.rule_name || d.rule_id)}<div class="mono muted" style="font-size:11px">${UI.esc(d.alert_id || "")}</div></td>
+              <td>${UI.levelBadge(d.alert_level)}</td>
+              <td><span class="mono" style="font-size:11px">${UI.esc(d.channel)} → ${UI.esc(d.target)}</span></td>
+              <td>${statusBadge(d.status)}</td>
+              <td class="num">${(d.attempts || []).length}</td>
+              <td class="muted" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${UI.esc(d.last_error || "")}">${UI.esc(d.last_error || "")}</td>
+            </tr>
+            <tr id="att-${i}" style="display:none;background:#f8fafc"><td colspan="7">${attemptsHtml(d)}</td></tr>
+          `).join("") : `<tr><td colspan="7"><div class="empty">该订阅还没有推送记录</div></td></tr>`}
+        </tbody>
+      </table>
+    </div>`;
+  document.querySelector("#modal-mask .modal-body").innerHTML = body;
+}
+
+// ---------------------------------------------------------------------------
+// 全局通知设置（SMTP / 重试），仅管理员
+// ---------------------------------------------------------------------------
+async function openSettings() {
+  let cfg;
+  try { cfg = (await API.get("/api/subscriptions/settings")).settings; }
+  catch (e) { UI.toast(e.message, "err"); return; }
+  const smtp = cfg.smtp || {};
+  const body = `
+    <div class="sub">推送失败时按指数退避（5s、10s、20s…）进行有限次重试，所有尝试都会记入推送历史。</div>
+    <div class="row">
+      <div class="field"><label>失败重试次数（不含首次）</label><input id="s-retries" type="number" min="0" max="10" value="${cfg.max_retries ?? 3}"></div>
+      <div class="field"><label>请求超时（秒）</label><input id="s-timeout" type="number" min="1" value="${cfg.timeout_sec ?? 5}"></div>
+      <div class="field"><label>退避基数（秒）</label><input id="s-backoff" type="number" min="1" value="${cfg.retry_backoff_base ?? 5}"></div>
+    </div>
+    <h3 style="margin:14px 0 8px;font-size:14px">📮 邮件 SMTP 配置</h3>
+    <div class="row">
+      <div class="field" style="flex:2"><label>SMTP 服务器</label><input id="s-host" value="${UI.esc(smtp.host || "")}" placeholder="smtp.example.com"></div>
+      <div class="field"><label>端口</label><input id="s-port" type="number" value="${smtp.port ?? 465}"></div>
+      <div class="field"><label>加密</label>
+        <select id="s-ssl"><option value="true" ${smtp.ssl !== false ? "selected" : ""}>SSL（465）</option>
+        <option value="false" ${smtp.ssl === false ? "selected" : ""}>STARTTLS/无（587/25）</option></select></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>用户名</label><input id="s-user" value="${UI.esc(smtp.username || "")}"></div>
+      <div class="field"><label>密码 / 授权码</label><input id="s-pass" type="password" placeholder="${smtp.has_password ? "已保存，留空不修改" : ""}"></div>
+    </div>
+    <div class="field"><label>发件人地址</label><input id="s-from" value="${UI.esc(smtp.from_addr || "")}" placeholder="risk@example.com"></div>`;
+  UI.modal("通知设置", body,
+    `<button class="btn" onclick="document.querySelector('#modal-mask').classList.remove('show')">取消</button>
+     <button class="btn primary" onclick="saveSettings()">保存设置</button>`);
+  window.__notifyCfg = cfg;
+}
+
+async function saveSettings() {
+  const body = {
+    max_retries: Number(document.getElementById("s-retries").value),
+    timeout_sec: Number(document.getElementById("s-timeout").value),
+    retry_backoff_base: Number(document.getElementById("s-backoff").value),
+    smtp: {
+      host: document.getElementById("s-host").value.trim(),
+      port: Number(document.getElementById("s-port").value),
+      ssl: document.getElementById("s-ssl").value === "true",
+      username: document.getElementById("s-user").value.trim(),
+      from_addr: document.getElementById("s-from").value.trim(),
+      password: document.getElementById("s-pass").value || "********",
+    },
+  };
+  try {
+    await API.put("/api/subscriptions/settings", body);
+    UI.toast("通知设置已保存", "ok");
+    document.querySelector("#modal-mask").classList.remove("show");
+  } catch (e) { UI.toast(e.message, "err"); }
+}
+
+// ---------------------------------------------------------------------------
+boot("告警通知订阅", async () => {
+  const me = App.currentUser();
+  const isAdmin = me && me.role === "admin";
+  document.getElementById("page").innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>🔔 告警通知订阅</h3>
+        <div class="flex">
+          ${isAdmin ? '<button class="btn sm" onclick="openSettings()">⚙️ 通知设置（SMTP/重试）</button>' : ""}
+          <button class="btn sm primary" onclick="openEditor(null)">＋ 新建订阅</button>
+        </div>
+      </div>
+      <div class="sub">命中规则并产生符合条件的新告警时，系统会通过 Webhook / 邮件即时推送；短时间窗内的聚合去重告警只推送一次。推送失败自动有限次重试，全部尝试均记录在案。</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>订阅</th><th>渠道</th><th>订阅条件</th><th>状态</th><th>推送数</th><th>成功/失败</th><th>成功率</th><th>最近推送</th><th></th></tr></thead>
+          <tbody id="sub-list"></tbody>
+        </table>
+      </div>
+    </div>`;
+  await loadMeta();
+  await load();
+});
+</script>
+</body>
+</html>

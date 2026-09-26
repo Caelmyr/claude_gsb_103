@@ -167,6 +167,7 @@ class RiskEngine:
 
         # 5) 告警聚合去重
         alert_results = []
+        new_alerts = []
         for rule in fired:
             if rule.action.get("type") in ("reject", "review", "alert"):
                 alert, created = self.alerts.process(rule, event, ts=ts)
@@ -185,6 +186,8 @@ class RiskEngine:
                     "level": alert.get("level"),
                     "subject": subject,
                 })
+                if created:
+                    new_alerts.append(alert)
 
         # 6) 持久化 + 统计
         self.events.add(event, ts=ts)
@@ -253,7 +256,26 @@ class RiskEngine:
             "event": event,
             "decision": decision,
         })
+
+        # 8) 告警通知订阅推送（仅新建告警触发；去重累加不重复推送，避免告警风暴）
+        if new_alerts:
+            self._dispatch_notifications(new_alerts, event, decision)
         return decision
+
+    def _dispatch_notifications(self, alerts, event, decision=None):
+        """把新告警交给通知服务（延迟导入避免循环依赖；失败不影响主链路）。"""
+        try:
+            from backend import runtime
+            notifier = getattr(runtime, "notifier", None)
+            if notifier is None:
+                return
+            for alert in alerts:
+                try:
+                    notifier.on_alert(alert, event, decision)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 沙箱：dry-run（不落盘、不告警、不广播、不污染窗口）

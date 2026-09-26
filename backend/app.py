@@ -10,6 +10,7 @@ from backend import config, auth, runtime
 from backend.engine.engine import RiskEngine
 from backend.flows import FlowStore
 from backend.settings_store import get_settings
+from backend.notify.notifier import NotifierService
 
 # 全局 socket 实例（供 app.py 与测试使用）
 sock = Sock()
@@ -27,7 +28,9 @@ def create_app():
     # 运行时单例
     engine = RiskEngine(settings=get_settings())
     flows = FlowStore()
-    runtime.init(engine, flows)
+    notifier = NotifierService(settings=get_settings())
+    notifier.start()
+    runtime.init(engine, flows, notifier)
 
     # 初始化样例数据（幂等）
     from backend import seed
@@ -35,8 +38,10 @@ def create_app():
 
     # ---- 注册 API 蓝图 ----
     from backend.api import (rules, events, alerts, stats, users,
-                             settings, sandbox, dict as dict_api, flows as flows_api)
-    for module in (rules, events, alerts, stats, users, settings, sandbox, dict_api, flows_api):
+                             settings, sandbox, dict as dict_api, flows as flows_api,
+                             subscriptions as subs_api)
+    for module in (rules, events, alerts, stats, users, settings, sandbox,
+                   dict_api, flows_api, subs_api):
         app.register_blueprint(module.bp)
 
     # ---- 认证 ----
@@ -113,7 +118,12 @@ app = create_app()
 
 
 def _shutdown():
-    """进程退出前 flush 事件缓冲。"""
+    """进程退出前 flush 事件缓冲、停止通知 worker。"""
+    if runtime.notifier is not None:
+        try:
+            runtime.notifier.stop()
+        except Exception:
+            pass
     if runtime.engine is not None:
         try:
             runtime.engine.events.stop()
