@@ -58,7 +58,11 @@ class AlertAggregator:
         return f"{y:04d}{mo:02d}{d:02d}"
 
     def _load_recent(self):
-        """启动时加载最近两天的告警，恢复去重索引。"""
+        """启动时加载最近两天「未关闭」的告警，恢复去重索引。
+
+        已解决（resolved）的告警不再参与去重判定，否则重启后相同指纹永远无法
+        产生新告警；其记录仍通过分片文件保留，供历史查询使用。
+        """
         now = time.time()
         days = [self._day_key(now - 86400), self._day_key(now)]
         for day in days:
@@ -67,7 +71,8 @@ class AlertAggregator:
             for a in data.get("alerts", []):
                 if a.get("id"):
                     self._alerts[a["id"]] = a
-                    self._fp_index[a.get("fingerprint", "")] = a["id"]
+                    if a.get("status") != "resolved":
+                        self._fp_index[a.get("fingerprint", "")] = a["id"]
 
     def _persist_day(self, day):
         path = os.path.join(config.ALERTS_DIR, f"{day}.json")

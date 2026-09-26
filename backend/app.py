@@ -27,7 +27,14 @@ def create_app():
     # 运行时单例
     engine = RiskEngine(settings=get_settings())
     flows = FlowStore()
-    runtime.init(engine, flows)
+
+    # 告警通知调度器：监听引擎广播，命中订阅的新告警即时推送（后台线程 + 失败重试）
+    from backend.notify.notifier import Notifier
+    notification_settings = get_settings().get("notification", {})
+    notifier = Notifier(engine=engine)
+    if notification_settings.get("enabled", True):
+        notifier.attach(engine)
+    runtime.init(engine, flows, notifier)
 
     # 初始化样例数据（幂等）
     from backend import seed
@@ -35,8 +42,10 @@ def create_app():
 
     # ---- 注册 API 蓝图 ----
     from backend.api import (rules, events, alerts, stats, users,
-                             settings, sandbox, dict as dict_api, flows as flows_api)
-    for module in (rules, events, alerts, stats, users, settings, sandbox, dict_api, flows_api):
+                             settings, sandbox, dict as dict_api, flows as flows_api,
+                             notifications)
+    for module in (rules, events, alerts, stats, users, settings, sandbox,
+                   dict_api, flows_api, notifications):
         app.register_blueprint(module.bp)
 
     # ---- 认证 ----
@@ -53,7 +62,6 @@ def create_app():
         session["username"] = username
         auth.record_login(username)
         pub = auth.public_user_dict(user)
-        pub["role"] = "viewer"
         return jsonify({"ok": True, "user": pub})
 
     @app.route("/api/logout", methods=["POST"])
@@ -113,7 +121,12 @@ app = create_app()
 
 
 def _shutdown():
-    """进程退出前 flush 事件缓冲。"""
+    """进程退出前 flush 事件缓冲、停止通知工作线程。"""
+    if runtime.notifier is not None:
+        try:
+            runtime.notifier.stop()
+        except Exception:
+            pass
     if runtime.engine is not None:
         try:
             runtime.engine.events.stop()

@@ -10,7 +10,8 @@ import os
 # 项目根目录 = backend/ 的上一级
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# 允许通过环境变量切换数据目录（测试 / 多实例部署）
+DATA_DIR = os.environ.get("RISK_DATA_DIR") or os.path.join(BASE_DIR, "data")
 FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 
 # 数据分片目录
@@ -23,10 +24,13 @@ FLOWS_DIR = os.path.join(DATA_DIR, "flows")        # 决策流
 DICT_DIR = os.path.join(DATA_DIR, "dict")          # 数据字典
 SETTINGS_DIR = os.path.join(DATA_DIR, "settings")  # 系统设置
 WINDOWS_DIR = os.path.join(DATA_DIR, "windows")    # 滑动窗口状态（可选持久化快照）
+NOTIFY_DIR = os.path.join(DATA_DIR, "notify")      # 告警通知订阅与推送记录
+DELIVERIES_DIR = os.path.join(NOTIFY_DIR, "deliveries")  # 推送记录按天分片
 
 USERS_FILE = os.path.join(USERS_DIR, "users.json")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "system.json")
 DICT_FILE = os.path.join(DICT_DIR, "dict.json")
+SUBSCRIPTIONS_FILE = os.path.join(NOTIFY_DIR, "subscriptions.json")
 
 # 服务配置
 API_HOST = os.environ.get("RISK_HOST", "0.0.0.0")
@@ -53,6 +57,21 @@ DEFAULT_SETTINGS = {
     },
     "event_types": ["login", "register", "order", "payment", "transfer", "withdraw", "sms", "api"],
     "dict_categories": ["事件类型", "风险等级", "动作类型", "渠道", "设备类型", "IP 段"],
+    # 告警通知推送默认配置（SMTP 留空时邮件渠道会返回明确的未配置错误）
+    "notification": {
+        "enabled": True,
+        "smtp": {
+            "host": "",
+            "port": 465,
+            "use_tls": True,
+            "username": "",
+            "password": "",
+            "from": "",
+            "timeout": 10,
+        },
+        "retry_max": 3,          # 默认失败重试次数上限（0~5）
+        "history_days": 7,       # 推送历史保留天数
+    },
 }
 
 # 动作类型
@@ -68,7 +87,8 @@ AGG_TYPES = ["count", "sum", "avg", "distinct_count", "max", "min"]
 def ensure_dirs():
     """确保所有数据目录存在。"""
     for d in (RULES_DIR, VERSIONS_DIR, EVENTS_DIR, ALERTS_DIR, USERS_DIR,
-              FLOWS_DIR, DICT_DIR, SETTINGS_DIR, WINDOWS_DIR):
+              FLOWS_DIR, DICT_DIR, SETTINGS_DIR, WINDOWS_DIR,
+              NOTIFY_DIR, DELIVERIES_DIR):
         os.makedirs(d, exist_ok=True)
     if not os.path.exists(SETTINGS_FILE):
         from backend.storage import atomic_write_json

@@ -24,6 +24,15 @@ async function load() {
   document.getElementById("w_max_keys").value = e.window_max_keys;
   document.getElementById("w_max_ev_key").value = e.window_max_events_per_key;
   document.getElementById("w_max_total").value = e.window_max_total_events;
+  const n = settings.notification || {};
+  const smtp = n.smtp || {};
+  document.getElementById("ntf_enabled").checked = n.enabled !== false;
+  document.getElementById("smtp_host").value = smtp.host || "";
+  document.getElementById("smtp_port").value = smtp.port || 465;
+  document.getElementById("smtp_tls").checked = smtp.use_tls !== false;
+  document.getElementById("smtp_user").value = smtp.username || "";
+  document.getElementById("smtp_pass").value = smtp.password || "";
+  document.getElementById("smtp_from").value = smtp.from || "";
 }
 
 async function save() {
@@ -37,6 +46,17 @@ async function save() {
       window_max_keys: parseInt(document.getElementById("w_max_keys").value) || 200000,
       window_max_events_per_key: parseInt(document.getElementById("w_max_ev_key").value) || 20000,
       window_max_total_events: parseInt(document.getElementById("w_max_total").value) || 2000000,
+    },
+    notification: {
+      enabled: document.getElementById("ntf_enabled").checked,
+      smtp: {
+        host: document.getElementById("smtp_host").value.trim(),
+        port: parseInt(document.getElementById("smtp_port").value) || 465,
+        use_tls: document.getElementById("smtp_tls").checked,
+        username: document.getElementById("smtp_user").value.trim(),
+        password: document.getElementById("smtp_pass").value,
+        from: document.getElementById("smtp_from").value.trim(),
+      },
     },
   };
   await API.put("/api/settings", patch);
@@ -64,6 +84,23 @@ boot("系统设置", () => {
         <div class="field"><label>滑动窗口最大键数</label><input id="w_max_keys" type="number"></div>
         <div class="field"><label>单键最大事件数</label><input id="w_max_ev_key" type="number"></div>
         <div class="field"><label>窗口最大事件总数</label><input id="w_max_total" type="number"></div>
+      </div>
+      <button class="btn primary" onclick="save()">保存设置</button>
+    </div>
+    <div class="card">
+      <h3>📨 告警通知推送</h3>
+      <div class="sub">邮件渠道使用 SMTP 发送；Webhook 渠道无需额外配置（在「通知订阅」页填写地址即可）</div>
+      <div class="grid cols-2">
+        <div class="field"><label style="font-weight:400;display:flex;align-items:center;gap:8px;margin-top:24px">
+          <input type="checkbox" id="ntf_enabled" style="width:auto"> 启用通知推送（关闭后不再监听新告警）</label></div>
+        <div></div>
+        <div class="field"><label>SMTP 服务器地址</label><input id="smtp_host" placeholder="smtp.example.com"></div>
+        <div class="field"><label>端口（SSL 通常 465，STARTTLS 通常 587）</label><input id="smtp_port" type="number"></div>
+        <div class="field"><label style="font-weight:400;display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="smtp_tls" style="width:auto"> 启用 SSL/TLS 加密</label></div>
+        <div class="field"><label>发件人地址（From）</label><input id="smtp_from" placeholder="risk@example.com"></div>
+        <div class="field"><label>SMTP 用户名（无需认证可留空）</label><input id="smtp_user"></div>
+        <div class="field"><label>SMTP 密码 / 授权码</label><input id="smtp_pass" type="password" placeholder="留空则不修改时需重新填写"></div>
       </div>
       <button class="btn primary" onclick="save()">保存设置</button>
     </div>

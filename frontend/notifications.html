@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>告警通知订阅 · 风控引擎</title>
+<link rel="stylesheet" href="assets/css/style.css">
+<script src="assets/js/api.js"></script>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const LEVELS = ["低", "中", "高", "严重"];
+let rulesCache = [];
+let eventTypes = [];
+let scopeAll = false;
+
+async function loadMeta() {
+  const [rr, sr] = await Promise.all([API.get("/api/rules"), API.get("/api/settings")]);
+  rulesCache = rr.rules || [];
+  eventTypes = (sr.settings && sr.settings.event_types) ||
+    ["login", "register", "payment", "transfer", "withdraw", "sms", "api"];
+}
+
+function levelBadges(list) {
+  if (!list || !list.length) return '<span class="muted">全部等级</span>';
+  return list.map(UI.levelBadge).join(" ");
+}
+function ruleNames(ids) {
+  if (!ids || !ids.length) return '<span class="muted">全部规则</span>';
+  return ids.map(id => {
+    const r = rulesCache.find(x => x.id === id);
+    return UI.badge(r ? (r.name || id) : id, "primary");
+  }).join(" ");
+}
+function typeBadges(list) {
+  if (!list || !list.length) return '<span class="muted">全部事件类型</span>';
+  return list.map(t => UI.badge(t, "info")).join(" ");
+}
+function channelBadges(channels) {
+  return (channels || []).map(ch => ch.type === "webhook"
+    ? `<span class="badge muted" title="${UI.esc(ch.url)}">🔗 Webhook</span>`
+    : `<span class="badge muted" title="${UI.esc(ch.to)}">✉️ ${UI.esc(ch.to)}</span>`).join(" ");
+}
+function rateText(st) {
+  if (!st || st.total === 0) return '<span class="muted">-</span>';
+  const finished = st.success + st.failed;
+  if (finished === 0) return '<span class="muted">推送中</span>';
+  const rate = Math.round((st.success / finished) * 100);
+  const cls = rate >= 90 ? "success" : rate >= 60 ? "warning" : "danger";
+  return `<span class="badge ${cls}">${rate}%</span>
+          <span class="muted">（${st.success}/${finished}）</span>`;
+}
+
+async function load() {
+  const isAdmin = App.hasRole("admin");
+  const url = "/api/notifications/subscriptions" + (isAdmin && scopeAll ? "?scope=all" : "");
+  const r = await API.get(url);
+  document.getElementById("scope-wrap").style.display = isAdmin ? "" : "none";
+  document.getElementById("scope-label").textContent = scopeAll ? "全部用户的订阅" : "仅我的订阅";
+  const tbody = document.getElementById("sub-list");
+  if (!r.subscriptions.length) {
+    tbody.innerHTML = `<tr><td colspan="10" class="empty">暂无订阅，点击右上角「＋ 新建订阅」开始配置</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = r.subscriptions.map(s => `
+    <tr data-id="${UI.esc(s.id)}">
+      <td>
+        <strong>${UI.esc(s.name)}</strong>
+        ${scopeAll ? `<div class="muted mono" style="font-size:11px">${UI.esc(s.owner)}</div>` : ""}
+      </td>
+      <td>${levelBadges(s.levels)}</td>
+      <td style="max-width:220px">${ruleNames(s.rule_ids)}</td>
+      <td>${typeBadges(s.event_types)}</td>
+      <td>${channelBadges(s.channels)}</td>
+      <td class="num">${s.retry_max}</td>
+      <td>${s.enabled ? '<span class="badge success">启用</span>' : '<span class="badge muted">已停用</span>'}</td>
+      <td class="num">${rateText(s.stats)}</td>
+      <td class="mono" style="font-size:11px">${UI.fmtTime(s.updated_at || s.created_at)}</td>
+      <td class="text-right" style="white-space:nowrap">
+        <button class="btn sm" onclick="toggle('${s.id}', ${!s.enabled})">${s.enabled ? "停用" : "启用"}</button>
+        <button class="btn sm" onclick="history('${UI.esc(s.id)}')">历史</button>
+        <button class="btn sm" onclick="editSub('${UI.esc(s.id)}')">编辑</button>
+        <button class="btn sm danger" onclick="del('${UI.esc(s.id)}')">删除</button>
+      </td>
+    </tr>`).join("");
+}
+
+// ---------------------------------------------------------------------------
+// 新建 / 编辑
+// ---------------------------------------------------------------------------
+const channelRows = [];
+function renderChannelRows(channels) {
+  channelRows.length = 0;
+  (channels || [{type: "webhook"}]).forEach(ch => addChannelRow(ch));
+}
+function addChannelRow(ch) {
+  ch = ch || {type: "webhook"};
+  const idx = channelRows.length;
+  channelRows.push(ch);
+  const wrap = document.getElementById("channels");
+  const row = document.createElement("div");
+  row.className = "channel-row";
+  row.dataset.idx = idx;
+  row.innerHTML = `
+    <select class="ch-type" style="width:110px">
+      <option value="webhook" ${ch.type === "webhook" ? "selected" : ""}>Webhook</option>
+      <option value="email" ${ch.type === "email" ? "selected" : ""}>邮件</option>
+    </select>
+    <input class="ch-target" placeholder="https://example.com/hook 或 ops@example.com"
+           value="${UI.esc(ch.url || ch.to || "")}" style="flex:1">
+    <input class="ch-secret" placeholder="签名密钥（可选，HMAC-SHA256）" value="${UI.esc(ch.secret || "")}"
+           style="width:180px;${ch.type === "email" ? "display:none" : ""}">
+    <button type="button" class="btn sm" onclick="testThis(this)">测试</button>
+    <button type="button" class="btn sm danger" onclick="this.parentNode.remove()">✕</button>`;
+  row.querySelector(".ch-type").onchange = (e) => {
+    row.querySelector(".ch-secret").style.display = e.target.value === "email" ? "none" : "";
+    row.querySelector(".ch-target").placeholder = e.target.value === "email"
+      ? "收件人邮箱，如 ops@example.com" : "https://example.com/hook";
+  };
+  wrap.appendChild(row);
+}
+function collectChannels() {
+  return [...document.querySelectorAll(".channel-row")].map(row => {
+    const type = row.querySelector(".ch-type").value;
+    const target = row.querySelector(".ch-target").value.trim();
+    const secret = row.querySelector(".ch-secret").value.trim();
+    return type === "email"
+      ? {type, to: target}
+      : {type, url: target, ...(secret ? {secret} : {})};
+  });
+}
+async function testThis(btn) {
+  const row = btn.parentNode;
+  const type = row.querySelector(".ch-type").value;
+  const target = row.querySelector(".ch-target").value.trim();
+  const secret = row.querySelector(".ch-secret").value.trim();
+  const channel = type === "email" ? {type, to: target} : {type, url: target, ...(secret ? {secret} : {})};
+  btn.disabled = true;
+  try {
+    const r = await API.post("/api/notifications/test", {channel});
+    UI.toast(r.ok ? "测试通知发送成功" : (r.message || "发送失败"), r.ok ? "ok" : "err");
+  } catch (e) { UI.toast(e.message, "err"); }
+  btn.disabled = false;
+}
+
+function checkboxListHTML(id, values, selected) {
+  return `<div class="check-grid" id="${id}">` + values.map(v =>
+    `<label class="chk"><input type="checkbox" value="${UI.esc(v)}" ${selected.includes(v) ? "checked" : ""}>${UI.esc(v)}</label>`
+  ).join("") + `</div>`;
+}
+function checkedValues(id) {
+  return [...document.querySelectorAll(`#${id} input:checked`)].map(cb => cb.value);
+}
+
+function openModal(title, sub, onSave) {
+  channelRows.length = 0;
+  UI.modal(title, `
+    <div class="field"><label>订阅名称</label><input id="m-name" value="${UI.esc(sub ? sub.name : "")}"></div>
+    <div class="field"><label>风险等级（不勾选 = 全部等级）</label>
+      ${checkboxListHTML("m-levels", LEVELS, sub ? sub.levels : ["高", "严重"])}
+    </div>
+    <div class="field"><label>规则（不勾选 = 全部规则）</label>
+      <div class="check-grid tall" id="m-rules">
+        ${rulesCache.map(r => `<label class="chk" title="${UI.esc(r.id)}">
+          <input type="checkbox" value="${UI.esc(r.id)}" ${sub && sub.rule_ids.includes(r.id) ? "checked" : ""}>
+          ${UI.esc(r.name || r.id)}</label>`).join("")}
+      </div>
+    </div>
+    <div class="field"><label>事件类型（不勾选 = 全部类型）</label>
+      ${checkboxListHTML("m-types", eventTypes, sub ? sub.event_types : [])}
+    </div>
+    <div class="field"><label>推送渠道（支持多个，逐个发送）</label>
+      <div id="channels" class="channels"></div>
+      <button type="button" class="btn sm mt" onclick="addChannelRow()">＋ 添加渠道</button>
+    </div>
+    <div class="row">
+      <div class="field"><label>失败重试次数（0~5）</label>
+        <input id="m-retry" type="number" min="0" max="5" value="${sub ? sub.retry_max : 3}"></div>
+      <div class="field"><label>状态</label>
+        <select id="m-enabled"><option value="true">启用</option><option value="false">停用</option></select>
+      </div>
+    </div>`,
+    `<button class="btn" onclick="document.querySelector('#modal-mask').classList.remove('show')">取消</button>
+     <button class="btn primary" id="m-save">保存</button>`);
+  renderChannelRows(sub ? sub.channels : null);
+  document.getElementById("m-enabled").value = String(sub ? sub.enabled : true);
+  document.getElementById("m-save").onclick = onSave;
+}
+function readForm() {
+  return {
+    name: document.getElementById("m-name").value.trim(),
+    levels: checkedValues("m-levels"),
+    rule_ids: checkedValues("m-rules"),
+    event_types: checkedValues("m-types"),
+    channels: collectChannels(),
+    retry_max: parseInt(document.getElementById("m-retry").value) || 0,
+    enabled: document.getElementById("m-enabled").value === "true",
+  };
+}
+function createSub() {
+  openModal("新建订阅", null, async () => {
+    try {
+      const body = readForm();
+      const r = await API.post("/api/notifications/subscriptions", body);
+      UI.toast("订阅已创建", "ok");
+      document.querySelector("#modal-mask").classList.remove("show");
+      load();
+    } catch (e) { UI.toast(e.message, "err"); }
+  });
+}
+async function editSub(id) {
+  const r = await API.get("/api/notifications/subscriptions" + (scopeAll && App.hasRole("admin") ? "?scope=all" : ""));
+  const sub = r.subscriptions.find(x => x.id === id);
+  if (!sub) { UI.toast("订阅不存在", "err"); return; }
+  openModal("编辑订阅：" + sub.name, sub, async () => {
+    try {
+      await API.put("/api/notifications/subscriptions/" + id, readForm());
+      UI.toast("已保存", "ok");
+      document.querySelector("#modal-mask").classList.remove("show");
+      load();
+    } catch (e) { UI.toast(e.message, "err"); }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 启停 / 删除
+// ---------------------------------------------------------------------------
+async function toggle(id, enabled) {
+  try {
+    await API.post(`/api/notifications/subscriptions/${id}/enable`, {enabled});
+    UI.toast(enabled ? "已启用" : "已停用", "ok");
+    load();
+  } catch (e) { UI.toast(e.message, "err"); }
+}
+async function del(id) {
+  if (!confirm("确认删除该订阅？删除后历史推送记录仍会保留。")) return;
+  try {
+    await API.del("/api/notifications/subscriptions/" + id);
+    UI.toast("已删除", "ok");
+    load();
+  } catch (e) { UI.toast(e.message, "err"); }
+}
+
+// ---------------------------------------------------------------------------
+// 推送历史
+// ---------------------------------------------------------------------------
+async function history(subId) {
+  UI.modal("推送历史", `<div id="hist-body">加载中…</div>`,
+    `<button class="btn" onclick="document.querySelector('#modal-mask').classList.remove('show')">关闭</button>`);
+  const [sr, hr] = await Promise.all([
+    API.get(`/api/notifications/stats?sub_id=${subId}`),
+    API.get(`/api/notifications/deliveries?sub_id=${subId}&page_size=20`),
+  ]);
+  const st = sr.stats;
+  const rate = (st.success + st.failed) ? Math.round(st.success / (st.success + st.failed) * 100) : null;
+  const rows = hr.deliveries.map(d => {
+    const stMap = {success: ["成功", "success"], failed: ["失败", "danger"],
+                   retrying: ["重试中", "warning"], pending: ["等待中", "muted"]};
+    const [label, cls] = stMap[d.status] || [d.status, "muted"];
+    const alert = d.alert || {};
+    return `<tr>
+      <td class="mono">${UI.fmtTime(d.created_at)}</td>
+      <td>${d.channel_type === "webhook" ? "🔗 Webhook" : "✉️ 邮件"}</td>
+      <td class="mono" style="max-width:180px;overflow:hidden;text-overflow:ellipsis"
+          title="${UI.esc(d.channel_target)}">${UI.esc(d.channel_target)}</td>
+      <td>${UI.levelBadge(alert.level)}</td>
+      <td>${UI.esc(alert.rule_name || alert.rule_id || "")}</td>
+      <td><span class="badge ${cls}">${label}</span></td>
+      <td class="num">${d.attempts}/${d.max_attempts}</td>
+      <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis"
+          title="${UI.esc(d.last_error)}">${UI.esc(d.last_error || "")}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("hist-body").innerHTML = `
+    <div class="grid cols-4 mb">
+      <div class="stat"><div class="label">总推送</div><div class="value">${st.total}</div></div>
+      <div class="stat"><div class="label">成功</div><div class="value success">${st.success}</div></div>
+      <div class="stat"><div class="label">失败（含重试中）</div><div class="value danger">${st.failed + st.retrying}</div></div>
+      <div class="stat"><div class="label">成功率</div><div class="value primary">${rate === null ? "-" : rate + "%"}</div></div>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>时间</th><th>渠道</th><th>目标</th><th>等级</th><th>规则</th><th>状态</th><th>尝试</th><th>错误</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="empty">暂无推送记录</td></tr>'}</tbody>
+    </table></div>
+    <div class="muted mt" style="font-size:12px">仅显示最近 20 条；重试按 10s/30s/60s… 指数退避，超限后置为失败</div>`;
+}
+
+boot("告警通知订阅", async () => {
+  const page = document.getElementById("page");
+  page.innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>🔔 告警通知订阅</h3>
+        <div class="flex">
+          <label id="scope-wrap" class="flex" style="margin:0;gap:6px;font-weight:400;font-size:12.5px;display:none">
+            <input type="checkbox" id="scope-all" style="width:auto"> <span id="scope-label">全部用户的订阅</span></label>
+          <button class="btn sm primary" onclick="createSub()">＋ 新建订阅</button>
+        </div>
+      </div>
+      <div class="sub">订阅条件（等级 / 规则 / 事件类型）命中且产生<strong>新告警</strong>时，按配置渠道即时推送；
+        去重聚合产生的告警不重复通知。推送失败自动指数退避重试，可在「历史」中查看每次推送与成功率。</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>名称</th><th>等级</th><th>规则</th><th>事件类型</th><th>渠道</th>
+            <th>重试</th><th>状态</th><th>成功率</th><th>更新时间</th><th></th>
+          </tr></thead>
+          <tbody id="sub-list"></tbody>
+        </table>
+      </div>
+    </div>`;
+  document.getElementById("scope-all").onchange = (e) => { scopeAll = e.target.checked; load(); };
+  await loadMeta();
+  await load();
+});
+</script>
+</body>
+</html>

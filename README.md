@@ -14,6 +14,7 @@
 | 决策流设计 | `flows.html` | 可视化拖拽节点（条件 / 动作 / 分支）编排决策流 |
 | 实时事件流 | `events.html` | WebSocket 滚动展示实时事件与命中告警 |
 | 告警列表 | `alerts.html` | 告警查询、去重计数、标记处理、导出（CSV/JSON） |
+| 告警通知订阅 | `notifications.html` | 按等级/规则/事件类型订阅，Webhook/邮件即时推送、失败重试、推送历史与成功率 |
 | 统计报表 | `stats.html` | ECharts 图表：命中率、拒绝率、事件趋势、规则命中排行 |
 | 用户管理 | `users.html` | 用户 CRUD、角色（admin/analyst/viewer）、重置密码 |
 | 系统设置 | `settings.html` | 匹配模式切换、去重窗口、滑动窗口容量参数 |
@@ -27,6 +28,7 @@
 - **动态规则热更新**：不可变编译快照 + 单引用原子替换，更新/删除/启停/回滚全程不中断匹配
 - **版本回滚**：每次保存追加版本历史快照，回滚以更高版本号重新发布
 - **告警聚合去重**：规则 + 主体字段指纹哈希索引，时间窗内累加计数，避免告警风暴
+- **告警通知订阅与推送**：按等级 / 规则 / 事件类型订阅，Webhook（HMAC 签名）与邮件（SMTP）渠道，后台线程即时推送、指数退避有限次重试，推送记录按天分片并统计成功率
 - **JSON 并发读写安全**：进程内 RLock + 跨进程 flock + 临时文件 + fsync + os.replace 原子替换
 - **事件分片存储**：按小时分片 JSON 文件，内存缓冲 + 后台线程异步刷盘
 - **WebSocket 实时推送**：命中事件与告警实时广播到前端
@@ -53,10 +55,15 @@ gsb3/
 │   │   ├── hot_update.py      # 规则注册表：原子热更新 + 版本历史 + 回滚
 │   │   ├── alert.py           # 告警聚合去重（指纹哈希索引）
 │   │   └── engine.py          # 风控引擎编排：匹配→聚合→决策→去重→持久化→广播
+│   ├── notify/
+│   │   ├── subscription_store.py # 通知订阅 CRUD、启停与条件匹配（等级/规则/事件类型）
+│   │   ├── delivery_store.py  # 推送记录按天分片、重试恢复、成功率统计
+│   │   └── notifier.py        # 通知调度器：引擎监听→匹配→后台推送→指数退避重试（Webhook/邮件）
 │   └── api/
 │       ├── rules.py           # 规则 CRUD、校验、版本、回滚
 │       ├── events.py          # 事件查询、摄取、模拟突发、存储统计
 │       ├── alerts.py          # 告警查询、标记、导出、统计
+│       ├── notifications.py   # 订阅管理、推送历史/成功率、渠道连通性测试
 │       ├── stats.py           # 统计报表（命中率/拒绝率/趋势）
 │       ├── flows.py           # 决策流 CRUD 与执行
 │       ├── sandbox.py         # dry-run、单规则/决策流测试、窗口预热
@@ -64,7 +71,7 @@ gsb3/
 │       ├── settings.py        # 系统设置
 │       └── dict.py            # 数据字典
 ├── frontend/                  # 11 个页面 + assets/css/style.css + assets/js/api.js
-├── data/                      # JSON 数据（运行时自动创建）：rules/versions/events/alerts/...
+├── data/                      # JSON 数据（运行时自动创建）：rules/versions/events/alerts/notify/...
 ├── requirements.txt
 ├── run.py                     # 一键启动脚本
 └── README.md
@@ -80,6 +87,7 @@ python run.py
 浏览器访问 http://localhost:5000
 
 > 端口冲突时可通过环境变量 `RISK_PORT=5001` 指定其他端口（`python run.py` 自动读取）。
+> 需要隔离数据目录（测试 / 多实例）时可设置 `RISK_DATA_DIR=/path/to/data`。
 
 **默认账号**
 - 管理员：`admin / admin123`（角色 admin）
@@ -107,6 +115,14 @@ python run.py
 - **指纹哈希索引**：`md5(rule_id + 归一化去重字段)` 生成指纹，内存哈希表建立「指纹 → 时间戳/计数」索引
 - **时间窗去重**：同一指纹在 `dedup_window_sec` 内重复出现只累加 `count`，不产生新告警记录；窗口外重新计入，避免告警风暴的同时保留告警频率信息
 
+### 4.5 告警通知订阅与可靠推送
+- **订阅模型**：属主订阅（owner）+ 三维过滤（风险等级 / 规则 id / 事件类型，空列表即不限制）+ 多渠道（Webhook URL、邮件收件人，可并存逐个发送）
+- **仅推新告警**：调度器作为引擎监听器消费广播，只对 `created=True` 的新建告警匹配订阅——去重窗口内累加的告警不重复通知，与告警聚合天然联动
+- **异步不阻塞主链路**：每条「订阅 × 渠道」落一条 delivery 记录后进入最小堆优先队列，单守护线程按到期时间发送；外发失败按 10s/30s/60s…（上限 300s）指数退避重试，次数上限可配（0~5，默认 3）
+- **重启恢复**：推送记录按天分片持久化，启动时加载近期分片，把仍有剩余次数的 `retrying` 记录重新入队，进程重启/崩溃不丢推送
+- **Webhook 安全**：POST JSON 报文，可配置密钥生成 `X-Signature: sha256=<HMAC>` 请求头，接收方可验签防伪造
+- **可观测**：每条订阅聚合推送总数/成功/失败/重试中与成功率，支持逐次尝试次数、错误原因的历史查询；渠道保存前校验 URL/邮箱格式，并提供一键连通性测试
+
 ### 5. JSON 规则并发读写安全
 - **进程内锁**：每个数据路径一把 `threading.RLock`，读-改-写原语全程持锁
 - **跨进程锁**：`fcntl.flock` 文件锁，多进程下仍互斥；内部原语不加 flock，避免同一进程内嵌套 flock 造成自死锁
@@ -118,6 +134,7 @@ python run.py
 - 规则：`GET/POST /api/rules`、`GET/PUT/DELETE /api/rules/<id>`、`POST /api/rules/validate`、`POST /api/rules/<id>/enable`、`GET /api/rules/<id>/versions`、`POST /api/rules/<id>/rollback`
 - 事件：`GET /api/events`、`POST /api/events/ingest`、`POST /api/events/simulate`、`GET /api/events/store_stats`
 - 告警：`GET /api/alerts`、`POST /api/alerts/mark`、`GET /api/alerts/export`、`GET /api/alerts/stats`
+- 通知订阅：`GET/POST /api/notifications/subscriptions`、`PUT/DELETE /api/notifications/subscriptions/<id>`、`POST /api/notifications/subscriptions/<id>/enable`、`GET /api/notifications/deliveries`、`GET /api/notifications/stats`、`POST /api/notifications/test`
 - 统计：`GET /api/stats`、`POST /api/stats/reset`
 - 决策流：`GET/POST /api/flows`、`GET/PUT/DELETE /api/flows/<id>`
 - 沙箱：`POST /api/sandbox/dry_run`、`/test_rule`、`/test_flow`、`/seed_window`
